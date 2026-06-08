@@ -1,6 +1,30 @@
 import { createRequire } from "module";
 
-const requireShared = createRequire(import.meta.url);
+const requireShared = (() => {
+  try {
+    if (typeof __filename !== "undefined" && __filename) {
+      return createRequire(__filename);
+    }
+  } catch (e) {}
+
+  try {
+    if (typeof import.meta !== "undefined" && import.meta.url) {
+      return createRequire(import.meta.url);
+    }
+  } catch (e) {}
+
+  try {
+    return createRequire(process.cwd());
+  } catch (e) {}
+
+  return (id: string) => {
+    if (typeof require !== "undefined") {
+      return require(id);
+    }
+    throw new Error(`Failed to create require helper and native require is not defined for: ${id}`);
+  };
+})();
+
 const pdfParse = requireShared("pdf-parse");
 const mammoth = requireShared("mammoth");
 
