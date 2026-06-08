@@ -1,41 +1,65 @@
 import { createRequire } from "module";
+import path from "path";
 
 const requireShared = (() => {
-  try {
-    if (typeof __filename !== "undefined" && __filename) {
-      return createRequire(__filename);
-    }
-  } catch (e) {}
-
+  // 1. If in CommonJS environment, use native require immediately
+  if (typeof require === "function") {
+    return require;
+  }
+  // 2. If in ES Module, use createRequire with import.meta.url
   try {
     if (typeof import.meta !== "undefined" && import.meta.url) {
       return createRequire(import.meta.url);
     }
-  } catch (e) {}
-
+  } catch (err) {}
+  // 3. Fallback: createRequire with __filename
   try {
-    return createRequire(process.cwd());
-  } catch (e) {}
-
-  return (id: string) => {
-    if (typeof require !== "undefined") {
-      return require(id);
+    if (typeof __filename !== "undefined" && __filename) {
+      return createRequire(__filename);
     }
-    throw new Error(`Failed to create require helper and native require is not defined for: ${id}`);
+  } catch (err) {}
+  // 4. Safe Fallback: createRequire using absolute file path of standard configuration file in current container working directory
+  try {
+    const dummyFilePath = path.join(process.cwd(), "package.json");
+    return createRequire(dummyFilePath);
+  } catch (err) {}
+  // 5. Ultimate fallback
+  return (id: string) => {
+    throw new Error(`Failed to initialize dynamic require loader for module: ${id}`);
   };
 })();
 
-const pdfParse = requireShared("pdf-parse");
-const mammoth = requireShared("mammoth");
+const pdfParseRaw = requireShared("pdf-parse");
+const mammothRaw = requireShared("mammoth");
+
+// Safe resolve function handling potential default export or direct wrapper function
+const pdfParse = typeof pdfParseRaw === "function" 
+  ? pdfParseRaw 
+  : (pdfParseRaw && pdfParseRaw.default ? pdfParseRaw.default : pdfParseRaw);
+
+const mammoth = mammothRaw && mammothRaw.default ? mammothRaw.default : mammothRaw;
 
 // PDF/DOCX text extraction helper
 export async function extractTextFromBuffer(buffer: Buffer, mimeType: string): Promise<string> {
+  console.log(`[EXTRACTOR-START] Extracting text. Buffer size: ${buffer.length} bytes, MimeType: ${mimeType}`);
+  
   if (mimeType === "application/pdf" || mimeType.includes("pdf")) {
     try {
+      console.log("[EXTRACTOR-PDF] Initializing pdf-parse on buffer...");
+      if (typeof pdfParse !== "function") {
+        console.error("[EXTRACTOR-PDF-ERROR] pdf-parse is NOT a function!", {
+          typeof_raw: typeof pdfParseRaw,
+          typeof_resolved: typeof pdfParse,
+          raw_keys: pdfParseRaw ? Object.keys(pdfParseRaw) : []
+        });
+        throw new TypeError("Compiled loader error: pdfParse is not a function.");
+      }
+      
       const data = await pdfParse(buffer);
+      console.log(`[EXTRACTOR-PDF-SUCCESS] Text extracted successfully. Words: ${data.text ? data.text.split(/\s+/).length : 0}`);
       return data.text || "";
     } catch (err: any) {
-      console.error("Error parsing PDF via pdf-parse, falling back:", err);
+      console.error("[EXTRACTOR-PDF-FATAL] pdf-parse failed, deploying smart text fallback:", err);
       // Fallback regex to capture printable ASCII from buffer
       return buffer.toString("utf-8").replace(/[^\x20-\x7E\r\n\t]/g, " ");
     }
@@ -45,14 +69,25 @@ export async function extractTextFromBuffer(buffer: Buffer, mimeType: string): P
     mimeType.includes("msword")
   ) {
     try {
+      console.log("[EXTRACTOR-DOCX] Initializing mammoth extraction...");
+      if (!mammoth || typeof mammoth.extractRawText !== "function") {
+        console.error("[EXTRACTOR-DOCX-ERROR] mammoth has no extractRawText function!", {
+          typeof_raw: typeof mammothRaw,
+          typeof_resolved: typeof mammoth,
+          raw_keys: mammothRaw ? Object.keys(mammothRaw) : []
+        });
+        throw new TypeError("Compiled loader error: mammoth.extractRawText is not a function.");
+      }
+      
       const result = await mammoth.extractRawText({ buffer });
+      console.log(`[EXTRACTOR-DOCX-SUCCESS] Extracted successfully. Raw length: ${result.value?.length || 0}`);
       return result.value || "";
     } catch (err: any) {
-      console.error("Error parsing Word DOCX document:", err);
+      console.error("[EXTRACTOR-DOCX-FATAL] Word parsing failed:", err);
       return buffer.toString("utf-8");
     }
   } else {
-    // Treat as raw text
+    console.log("[EXTRACTOR-LOG] Unknown mimetype. Parsing raw generic UTF-8...");
     return buffer.toString("utf-8");
   }
 }

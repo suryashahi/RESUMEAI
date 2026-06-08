@@ -105,6 +105,9 @@ async function callAIWithFallback<T>(
   geminiSchema?: any
 ): Promise<{ data: T; provider: string }> {
   const errors: Error[] = [];
+  console.log("[AI-ROUTER] Entering callAIWithFallback pipeline.");
+  console.log(`[AI-ROUTER] Prompt prefix sample: "${prompt.slice(0, 150)}..."`);
+  console.log(`[AI-ROUTER] Keys present status: [Gemini: ${process.env.GEMINI_API_KEY ? "YES" : "NO"}, OpenRouter: ${process.env.OPENROUTER_API_KEY ? "YES" : "NO"}, Groq: ${process.env.GROQ_API_KEY ? "YES" : "NO"}]`);
 
   // Attempt 1: Gemini 2.5 Flash
   try {
@@ -113,13 +116,14 @@ async function callAIWithFallback<T>(
       throw new Error("Gemini API key is not configured.");
     }
 
-    console.log("[AI-ROUTER] Routing primary request to Gemini...");
+    console.log("[AI-ROUTER-GEMINI] Routing primary request to Gemini...");
     
     const config: any = {
       responseMimeType: "application/json",
     };
     if (systemInstruction) {
       config.systemInstruction = systemInstruction;
+      console.log(`[AI-ROUTER-GEMINI] With systeminstruction: "${systemInstruction.slice(0, 80)}..."`);
     }
     if (geminiSchema) {
       config.responseSchema = geminiSchema;
@@ -127,9 +131,13 @@ async function callAIWithFallback<T>(
 
     // Call Gemini with 15-second timeout safeguard
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    const timeoutId = setTimeout(() => {
+      console.warn("[AI-ROUTER-GEMINI-TIMEOUT] Gemini did not respond within 15s. Aborting...");
+      controller.abort();
+    }, 15000);
 
     try {
+      console.log("[AI-ROUTER-GEMINI] Requesting generateContent from Gemini client...");
       const response = await client.models.generateContent({
         model: "gemini-2.5-flash",
         contents: prompt,
@@ -138,14 +146,18 @@ async function callAIWithFallback<T>(
       clearTimeout(timeoutId);
 
       const text = response.text || "";
-      const parsed = JSON.parse(cleanJsonOutput(text));
+      console.log(`[AI-ROUTER-GEMINI-SUCCESS] Received response. Text length: ${text.length}. Parsing JSON...`);
+      const cleaned = cleanJsonOutput(text);
+      const parsed = JSON.parse(cleaned);
+      console.log("[AI-ROUTER-GEMINI-SUCCESS] Successfully parsed Gemini JSON payload!");
       return { data: parsed as T, provider: "Gemini 2.5 Flash" };
     } catch (err: any) {
       clearTimeout(timeoutId);
+      console.error("[AI-ROUTER-GEMINI-ERROR] Exception in Gemini API pipeline:", err);
       throw err;
     }
   } catch (err: any) {
-    console.error(`[AI-ROUTER] Gemini 2.5 Flash failed (Error: ${err.message}). Cascading automatically to Mixtral...`);
+    console.error(`[AI-ROUTER] Gemini 2.5 Flash failed (Error: ${err.message || String(err)}). Cascading automatically to Mixtral...`);
     errors.push(err);
   }
 
@@ -156,12 +168,16 @@ async function callAIWithFallback<T>(
       throw new Error("OpenRouter API key is not configured.");
     }
 
-    console.log("[AI-ROUTER] Routing secondary request to OpenRouter Mixtral...");
+    console.log("[AI-ROUTER-OPENROUTER] Routing secondary request to OpenRouter Mixtral...");
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 20000);
+    const timeoutId = setTimeout(() => {
+      console.warn("[AI-ROUTER-OPENROUTER-TIMEOUT] OpenRouter did not respond within 20s. Aborting...");
+      controller.abort();
+    }, 20000);
 
     try {
+      console.log("[AI-ROUTER-OPENROUTER] Dispatching HTTP fetch to openrouter.ai...");
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -186,19 +202,23 @@ async function callAIWithFallback<T>(
 
       if (!response.ok) {
         const errText = await response.text();
+        console.error(`[AI-ROUTER-OPENROUTER-HTTP-ERROR] Stats: ${response.status}. Details:`, errText);
         throw new Error(`OpenRouter API responded with status ${response.status}: ${errText}`);
       }
 
       const result = await response.json();
       const content = result.choices?.[0]?.message?.content || "";
+      console.log(`[AI-ROUTER-OPENROUTER-SUCCESS] Content returned length: ${content.length}. Parsing...`);
       const parsed = JSON.parse(cleanJsonOutput(content));
+      console.log("[AI-ROUTER-OPENROUTER-SUCCESS] Successfully parsed OpenRouter response payload!");
       return { data: parsed as T, provider: "OpenRouter Mixtral 8x7B" };
     } catch (err: any) {
       clearTimeout(timeoutId);
+      console.error("[AI-ROUTER-OPENROUTER-ERROR] Exception in OpenRouter pipeline:", err);
       throw err;
     }
   } catch (err: any) {
-    console.error(`[AI-ROUTER] OpenRouter Mixtral failed (Error: ${err.message}). Cascading automatically to Groq Llama...`);
+    console.error(`[AI-ROUTER] OpenRouter Mixtral failed (Error: ${err.message || String(err)}). Cascading automatically to Groq Llama...`);
     errors.push(err);
   }
 
@@ -209,12 +229,16 @@ async function callAIWithFallback<T>(
       throw new Error("Groq API key is not configured.");
     }
 
-    console.log("[AI-ROUTER] Routing tertiary request to Groq Llama 3.3 70B...");
+    console.log("[AI-ROUTER-GROQ] Routing tertiary request to Groq Llama 3.3 70B...");
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 20000);
+    const timeoutId = setTimeout(() => {
+      console.warn("[AI-ROUTER-GROQ-TIMEOUT] Groq did not respond within 20s. Aborting...");
+      controller.abort();
+    }, 20000);
 
     try {
+      console.log("[AI-ROUTER-GROQ] Dispatching HTTP fetch to api.groq.com...");
       const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -237,19 +261,23 @@ async function callAIWithFallback<T>(
 
       if (!response.ok) {
         const errText = await response.text();
+        console.error(`[AI-ROUTER-GROQ-HTTP-ERROR] Stats: ${response.status}. Details:`, errText);
         throw new Error(`Groq API responded with status ${response.status}: ${errText}`);
       }
 
       const result = await response.json();
       const content = result.choices?.[0]?.message?.content || "";
+      console.log(`[AI-ROUTER-GROQ-SUCCESS] Content response text length: ${content.length}. Parsing...`);
       const parsed = JSON.parse(cleanJsonOutput(content));
+      console.log("[AI-ROUTER-GROQ-SUCCESS] Successfully parsed Groq response!");
       return { data: parsed as T, provider: "Groq Llama 3.3" };
     } catch (err: any) {
       clearTimeout(timeoutId);
+      console.error("[AI-ROUTER-GROQ-ERROR] Exception in Groq API pipe:", err);
       throw err;
     }
   } catch (err: any) {
-    console.error(`[AI-ROUTER] Groq Llama 3.3 failed (Error: ${err.message}).`);
+    console.error(`[AI-ROUTER] Groq Llama 3.3 failed (Error: ${err.message || String(err)}).`);
     errors.push(err);
   }
 
