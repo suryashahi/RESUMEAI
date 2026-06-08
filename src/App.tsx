@@ -8,6 +8,7 @@ import JobMatchTool from "./components/JobMatchTool";
 import ResumeBuilderTool from "./components/ResumeBuilderTool";
 import CoverLetterTool from "./components/CoverLetterTool";
 import CareerRoadmapTool from "./components/CareerRoadmapTool";
+import API_URL from "./config/api";
 
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(true);
@@ -84,7 +85,7 @@ export default function App() {
     setErrorToast("");
 
     try {
-      const response = await fetch("/api/analyze-resume", {
+      const response = await fetch(`${API_URL}/api/analyze-resume`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -136,7 +137,7 @@ export default function App() {
     }
     const currentResumeText = recentAnalyses[0].resumeName; // fallback name representation
     
-    const response = await fetch("/api/job-match", {
+    const response = await fetch(`${API_URL}/api/job-match`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -166,7 +167,7 @@ export default function App() {
     }
     const baseText = `Resume summary highlights: ${recentAnalyses[0].analysis.strengths.join(", ")}`;
 
-    const response = await fetch("/api/generate-cover-letter", {
+    const response = await fetch(`${API_URL}/api/generate-cover-letter`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -190,7 +191,7 @@ export default function App() {
 
   // GENERATE RESUME STRUC SENDER
   const handleGenerateResumeBuilder = async (experience: string, skills: string, role: string): Promise<ResumeBuilderData> => {
-    const response = await fetch("/api/generate-resume-builder", {
+    const response = await fetch(`${API_URL}/api/generate-resume-builder`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ experience, skills, role })
@@ -211,7 +212,7 @@ export default function App() {
 
   // GENERATE ROADMAP SENDER
   const handleGenerateRoadmap = async (skills: string, role: string): Promise<CareerRoadmapData> => {
-    const response = await fetch("/api/generate-roadmap", {
+    const response = await fetch(`${API_URL}/api/generate-roadmap`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ skills, role })
