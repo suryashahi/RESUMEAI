@@ -1,0 +1,6 @@
+{
+  "name": "ResumeAI",
+  "description": "Premium AI-powered Resume Review platform that helps users improve their resumes, increase ATS compatibility, identify missing skills, and receive actionable career recommendations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
