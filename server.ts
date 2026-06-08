@@ -36,11 +36,57 @@ const requireShared = (() => {
 const pdfParseRaw = requireShared("pdf-parse");
 const mammothRaw = requireShared("mammoth");
 
-const pdfParse = typeof pdfParseRaw === "function" 
-  ? pdfParseRaw 
-  : (pdfParseRaw && pdfParseRaw.default ? pdfParseRaw.default : pdfParseRaw);
+// Safe resolve function handling potential default export or direct wrapper function
+let pdfParse: any = null;
+try {
+  console.log("[SERVER-PDF-INIT] Raw pdf-parse loading metrics:", {
+    typeof_raw: typeof pdfParseRaw,
+    has_default: !!(pdfParseRaw && pdfParseRaw.default),
+    keys: pdfParseRaw ? Object.keys(pdfParseRaw) : []
+  });
 
-const mammoth = mammothRaw && mammothRaw.default ? mammothRaw.default : mammothRaw;
+  if (typeof pdfParseRaw === "function") {
+    pdfParse = pdfParseRaw;
+  } else if (pdfParseRaw && typeof pdfParseRaw.default === "function") {
+    pdfParse = pdfParseRaw.default;
+  } else if (pdfParseRaw && typeof pdfParseRaw.pdfParse === "function") {
+    pdfParse = pdfParseRaw.pdfParse;
+  } else if (pdfParseRaw) {
+    const funcKey = Object.keys(pdfParseRaw).find(k => typeof (pdfParseRaw as any)[k] === "function");
+    if (funcKey) {
+      console.log(`[SERVER-PDF-INIT] Auto-resolved to function property "${funcKey}"`);
+      pdfParse = (pdfParseRaw as any)[funcKey];
+    }
+  }
+} catch (e: any) {
+  console.error("[SERVER-PDF-INIT] Failed to parse default key resolver:", e);
+}
+
+let mammoth: any = null;
+try {
+  console.log("[SERVER-DOCX-INIT] Raw mammoth loading metrics:", {
+    typeof_raw: typeof mammothRaw,
+    keys: mammothRaw ? Object.keys(mammothRaw) : []
+  });
+  
+  if (mammothRaw && typeof mammothRaw.extractRawText === "function") {
+    mammoth = mammothRaw;
+  } else if (mammothRaw && mammothRaw.default && typeof mammothRaw.default.extractRawText === "function") {
+    mammoth = mammothRaw.default;
+  } else if (mammothRaw) {
+    if (typeof mammothRaw === "function" && (mammothRaw as any).extractRawText) {
+      mammoth = mammothRaw;
+    } else {
+      const foundKey = Object.keys(mammothRaw).find(k => (mammothRaw as any)[k] && typeof (mammothRaw as any)[k].extractRawText === "function");
+      if (foundKey) {
+        console.log(`[SERVER-DOCX-INIT] Auto-resolved to property "${foundKey}"`);
+        mammoth = (mammothRaw as any)[foundKey];
+      }
+    }
+  }
+} catch (e: any) {
+  console.error("[SERVER-DOCX-INIT] Failed to resolve mammoth structure:", e);
+}
 
 import dotenv from "dotenv";
 import { 
@@ -178,10 +224,16 @@ app.post("/api/analyze-resume", async (req, res) => {
       });
     }
 
-    console.log(`[ROUTE-ANALYZE] Parsing document file. Name: ${fileName || "unnamed"}, Type: ${fileType || "unknown"}`);
+    console.log("[CODE-PATH-TRACE] [STAGE 1: Upload] Received base64 payload.");
+    const buffer = Buffer.from(fileData, "base64");
+    
+    // Log required Upload details
+    console.log(`[ROUTE-ANALYZE-AUDIT] Uploaded file size: ${buffer.length} bytes`);
+    console.log(`[ROUTE-ANALYZE-AUDIT] File type: ${fileType || "unknown"}`);
+
+    console.log("[CODE-PATH-TRACE] [STAGE 2: Parse PDF / DOCX] Executing extractTextFromBuffer...");
     let resumeText = "";
     try {
-      const buffer = Buffer.from(fileData, "base64");
       resumeText = await extractTextFromBuffer(buffer, fileType || "");
     } catch (parseErr: any) {
       console.error("[ROUTE-ANALYZE] Failed during pdf/docx binary extraction:", parseErr);
@@ -191,6 +243,23 @@ app.post("/api/analyze-resume", async (req, res) => {
         error: "File extraction sub-pipeline failed: " + parseErr.message
       });
     }
+
+    console.log("[CODE-PATH-TRACE] [STAGE 3: Extract Text] Extraction complete.");
+    // Log required Extracted details
+    console.log(`[ROUTE-ANALYZE-AUDIT] Extracted text length: ${resumeText ? resumeText.length : 0} characters`);
+    console.log(`[ROUTE-ANALYZE-AUDIT] First 500 characters of extracted text: "${resumeText ? resumeText.slice(0, 500) : ""}"`);
+
+    // Validation check: If extracted text length < 100 characters, return "Resume text extraction failed"
+    if (!resumeText || resumeText.trim().length < 100) {
+      console.warn(`[ROUTE-ANALYZE-WARN] Validation failed. Extracted text too short: ${resumeText ? resumeText.length : 0} chars.`);
+      return res.status(400).json({
+        success: false,
+        step: "document-parsing",
+        error: "Resume text extraction failed"
+      });
+    }
+
+    console.log("[CODE-PATH-TRACE] [STAGE 4: AI Router] Routing to generative model evaluation...");
 
     const hasKeys = process.env.GEMINI_API_KEY || process.env.OPENROUTER_API_KEY || process.env.GROQ_API_KEY;
     if (!hasKeys) {

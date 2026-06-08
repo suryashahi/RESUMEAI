@@ -33,35 +33,169 @@ const pdfParseRaw = requireShared("pdf-parse");
 const mammothRaw = requireShared("mammoth");
 
 // Safe resolve function handling potential default export or direct wrapper function
-const pdfParse = typeof pdfParseRaw === "function" 
-  ? pdfParseRaw 
-  : (pdfParseRaw && pdfParseRaw.default ? pdfParseRaw.default : pdfParseRaw);
+let pdfParse: any = null;
+try {
+  console.log("[EXTRACTOR-PDF-INIT] Raw pdf-parse loading metrics:", {
+    typeof_raw: typeof pdfParseRaw,
+    has_default: !!(pdfParseRaw && pdfParseRaw.default),
+    keys: pdfParseRaw ? Object.keys(pdfParseRaw) : []
+  });
 
-const mammoth = mammothRaw && mammothRaw.default ? mammothRaw.default : mammothRaw;
+  if (typeof pdfParseRaw === "function") {
+    pdfParse = pdfParseRaw;
+  } else if (pdfParseRaw && typeof pdfParseRaw.default === "function") {
+    pdfParse = pdfParseRaw.default;
+  } else if (pdfParseRaw && typeof pdfParseRaw.pdfParse === "function") {
+    pdfParse = pdfParseRaw.pdfParse;
+  } else if (pdfParseRaw) {
+    const funcKey = Object.keys(pdfParseRaw).find(k => typeof (pdfParseRaw as any)[k] === "function");
+    if (funcKey) {
+      console.log(`[EXTRACTOR-PDF-INIT] Auto-resolved to function property "${funcKey}"`);
+      pdfParse = (pdfParseRaw as any)[funcKey];
+    }
+  }
+} catch (e: any) {
+  console.error("[EXTRACTOR-PDF-INIT] Failed to parse default key resolver:", e);
+}
+
+let mammoth: any = null;
+try {
+  console.log("[EXTRACTOR-DOCX-INIT] Raw mammoth loading metrics:", {
+    typeof_raw: typeof mammothRaw,
+    keys: mammothRaw ? Object.keys(mammothRaw) : []
+  });
+  
+  if (mammothRaw && typeof mammothRaw.extractRawText === "function") {
+    mammoth = mammothRaw;
+  } else if (mammothRaw && mammothRaw.default && typeof mammothRaw.default.extractRawText === "function") {
+    mammoth = mammothRaw.default;
+  } else if (mammothRaw) {
+    if (typeof mammothRaw === "function" && (mammothRaw as any).extractRawText) {
+      mammoth = mammothRaw;
+    } else {
+      const foundKey = Object.keys(mammothRaw).find(k => (mammothRaw as any)[k] && typeof (mammothRaw as any)[k].extractRawText === "function");
+      if (foundKey) {
+        console.log(`[EXTRACTOR-DOCX-INIT] Auto-resolved to property "${foundKey}"`);
+        mammoth = (mammothRaw as any)[foundKey];
+      }
+    }
+  }
+} catch (e: any) {
+  console.error("[EXTRACTOR-DOCX-INIT] Failed to resolve mammoth structure:", e);
+}
+
+async function extractWithPdfJS(buffer: Buffer): Promise<string> {
+  console.log("[EXTRACTOR-PDFJS] Initializing pdfjs-dist fallback extraction...");
+  let pdfjs: any = null;
+  try {
+    pdfjs = requireShared("pdfjs-dist");
+  } catch (err1) {
+    console.log("[EXTRACTOR-PDFJS] Standard require('pdfjs-dist') failed, attempting legacy build path...", err1);
+    try {
+      pdfjs = requireShared("pdfjs-dist/legacy/build/pdf.js");
+    } catch (err2) {
+      console.error("[EXTRACTOR-PDFJS-FATAL] All pdfjs-dist import formats failed inside commonjs mapping:", err2);
+      throw new Error("Could not import pdfjs-dist in this environment.");
+    }
+  }
+
+  if (!pdfjs) {
+    throw new Error("Resolved pdfjs-dist module is undefined.");
+  }
+
+  const data = new Uint8Array(buffer);
+  const loadingTask = pdfjs.getDocument({
+    data: data,
+    useSystemFonts: false,
+    disableFontFace: true
+  });
+
+  const pdf = await loadingTask.promise;
+  console.log(`[EXTRACTOR-PDFJS] PDF loaded by pdfjs. Pages: ${pdf.numPages}`);
+  let fullText = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const textContent = await page.getTextContent();
+    const pageText = textContent.items
+      .map((item: any) => item.str || "")
+      .join(" ");
+    fullText += pageText + "\n";
+  }
+  return fullText;
+}
+
+function extractTextFallback(buffer: Buffer): string {
+  console.log("[EXTRACTOR-FALLBACK] Running heuristic plain-text regex extraction...");
+  const str = buffer.toString("binary");
+  // Find text elements within standard PDF parentheses: e.g. (Some Text) Tj
+  const matches = str.match(/\(([^)]+)\)\s*Tj/g) || str.match(/\(([^)]+)\)/g) || [];
+  let extracted = matches
+    .map(m => {
+      const inside = m.match(/\((.*)\)/);
+      return inside ? inside[1] : "";
+    })
+    .filter(t => t && t.length > 2 && !t.includes("/") && !t.includes("\\") && /[a-zA-Z0-9\s]/.test(t))
+    .join(" ");
+
+  if (extracted.trim().length < 100) {
+    console.log("[EXTRACTOR-FALLBACK] Parenthesis parser returned too little text. Using regex sweep for printable alphanumeric structures...");
+    const asciiStr = buffer.toString("utf-8");
+    const sweepMatches = asciiStr.match(/[a-zA-Z0-9\s.,/@:()-]{4,100}/g) || [];
+    extracted = sweepMatches
+      .map(v => v.trim())
+      .filter(v => v.length > 3 && !v.includes("PDF-") && !v.includes("obj") && !v.includes("endobj"))
+      .join(" ");
+  }
+  return extracted;
+}
 
 // PDF/DOCX text extraction helper
 export async function extractTextFromBuffer(buffer: Buffer, mimeType: string): Promise<string> {
-  console.log(`[EXTRACTOR-START] Extracting text. Buffer size: ${buffer.length} bytes, MimeType: ${mimeType}`);
+  console.log(`[EXTRACTOR-START] Pipeline activated. File size: ${buffer.length} bytes, MimeType: ${mimeType}`);
   
   if (mimeType === "application/pdf" || mimeType.includes("pdf")) {
+    let extractedText = "";
+
+    // Attempt 1: pdf-parse
     try {
-      console.log("[EXTRACTOR-PDF] Initializing pdf-parse on buffer...");
+      console.log("[EXTRACTOR-PDF-STAGE1] Running pdf-parse on buffer...");
       if (typeof pdfParse !== "function") {
-        console.error("[EXTRACTOR-PDF-ERROR] pdf-parse is NOT a function!", {
-          typeof_raw: typeof pdfParseRaw,
-          typeof_resolved: typeof pdfParse,
-          raw_keys: pdfParseRaw ? Object.keys(pdfParseRaw) : []
-        });
-        throw new TypeError("Compiled loader error: pdfParse is not a function.");
+        throw new TypeError("pdfParse is not a function in the resolved workspace.");
       }
       
-      const data = await pdfParse(buffer);
-      console.log(`[EXTRACTOR-PDF-SUCCESS] Text extracted successfully. Words: ${data.text ? data.text.split(/\s+/).length : 0}`);
-      return data.text || "";
+      const parsed = await pdfParse(buffer);
+      console.log("[EXTRACTOR-PDF-STAGE1] pdf-parse execution success. Checking text content integrity...");
+      if (parsed && typeof parsed.text === "string" && parsed.text.trim().length >= 100) {
+        console.log(`[EXTRACTOR-PDF-STAGE1-SUCCESS] Valid text verified. Length: ${parsed.text.trim().length}`);
+        return parsed.text;
+      } else {
+        throw new Error(`pdf-parse returned insufficient text length (${parsed?.text?.trim()?.length || 0} chars)`);
+      }
     } catch (err: any) {
-      console.error("[EXTRACTOR-PDF-FATAL] pdf-parse failed, deploying smart text fallback:", err);
-      // Fallback regex to capture printable ASCII from buffer
-      return buffer.toString("utf-8").replace(/[^\x20-\x7E\r\n\t]/g, " ");
+      console.warn(`[EXTRACTOR-PDF-STAGE1-FAILED] pdf-parse failed: ${err.message || String(err)}. Cascading to pdfjs-dist fallback...`);
+    }
+
+    // Attempt 2: pdfjs-dist
+    try {
+      extractedText = await extractWithPdfJS(buffer);
+      if (extractedText && extractedText.trim().length >= 100) {
+        console.log(`[EXTRACTOR-PDF-STAGE2-SUCCESS] pdfjs-dist extraction successful. Length: ${extractedText.trim().length}`);
+        return extractedText;
+      } else {
+        throw new Error(`pdfjs-dist returned insufficient text length (${extractedText?.trim()?.length || 0} chars)`);
+      }
+    } catch (pdfjsErr: any) {
+      console.warn(`[EXTRACTOR-PDF-STAGE2-FAILED] pdfjs-dist failed: ${pdfjsErr.message || String(pdfjsErr)}. Cascading to heuristic sweep...`);
+    }
+
+    // Attempt 3: Heuristic Regex Fallback
+    try {
+      extractedText = extractTextFallback(buffer);
+      console.log(`[EXTRACTOR-PDF-STAGE3-COMPLETED] Heuristic sweep finished. Length: ${extractedText.length}`);
+      return extractedText;
+    } catch (fallbackErr: any) {
+      console.error("[EXTRACTOR-PDF-STAGE3-FAILED] Heuristic fallback failed:", fallbackErr);
+      return "";
     }
   } else if (
     mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" || 

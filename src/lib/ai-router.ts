@@ -62,12 +62,24 @@ export interface CareerRoadmapData {
   };
 }
 
+// Safe truncation helper to preserve token limits across all models and avoid rate bottlenecks
+function truncateInputs(text: string, maxChars: number = 15000): string {
+  if (!text) return "";
+  const cleaned = text.trim();
+  if (cleaned.length <= maxChars) {
+    return cleaned;
+  }
+  console.log(`[AI-ROUTER-TRUNCATION] Input text length (${cleaned.length} chars) exceeds optimal boundary (${maxChars} chars). Truncating...`);
+  return cleaned.slice(0, maxChars) + "\n\n... [Content truncated at safety limit to preserve token quota and prevent rate limits] ...";
+}
+
 // Lazy initializer for Gemini Client
 let aiClient: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI | null {
   if (!aiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
+    let apiKey = process.env.GEMINI_API_KEY;
     if (apiKey) {
+      apiKey = apiKey.trim().replace(/^['"]|['"]$/g, "");
       aiClient = new GoogleGenAI({
         apiKey,
         httpOptions: {
@@ -95,9 +107,9 @@ function cleanJsonOutput(rawText: string): string {
 
 /**
  * Generic Router that handles fallback routing chain:
- * 1. Gemini (Primary)
- * 2. OpenRouter Mixtral (Fallback #1)
- * 3. Groq Llama 3.3 (Fallback #2)
+ * 1. Gemini 2.5 Flash (Primary)
+ * 2. OpenRouter Mixtral 8x7B (Fallback #1)
+ * 3. Groq Llama 3.3 70B (Fallback #2)
  */
 async function callAIWithFallback<T>(
   prompt: string,
@@ -106,30 +118,49 @@ async function callAIWithFallback<T>(
 ): Promise<{ data: T; provider: string }> {
   const errors: Error[] = [];
   console.log("[AI-ROUTER] Entering callAIWithFallback pipeline.");
-  console.log(`[AI-ROUTER] Prompt prefix sample: "${prompt.slice(0, 150)}..."`);
-  console.log(`[AI-ROUTER] Keys present status: [Gemini: ${process.env.GEMINI_API_KEY ? "YES" : "NO"}, OpenRouter: ${process.env.OPENROUTER_API_KEY ? "YES" : "NO"}, Groq: ${process.env.GROQ_API_KEY ? "YES" : "NO"}]`);
+  console.log(`[AI-ROUTER] Prompt total characters: ${prompt.length}. Sample: "${prompt.slice(0, 120)}..."`);
+
+  // Extract keys and sanitize quotes/whitespace
+  const rawGeminiKey = (process.env.GEMINI_API_KEY || "").trim().replace(/^['"]|['"]$/g, "");
+  const rawOpenRouterKey = (process.env.OPENROUTER_API_KEY || "").trim().replace(/^['"]|['"]$/g, "");
+  const rawGroqKey = (process.env.GROQ_API_KEY || "").trim().replace(/^['"]|['"]$/g, "");
+
+  const geminiPresent = rawGeminiKey.length > 0;
+  const openRouterPresent = rawOpenRouterKey.length > 0;
+  const groqPresent = rawGroqKey.length > 0;
+
+  console.log(`[AI-ROUTER-INFO] Active validation credentials check:`, {
+    GeminiKey: geminiPresent ? `PRESENT (Length: ${rawGeminiKey.length})` : "MISSING",
+    OpenRouterKey: openRouterPresent ? `PRESENT (Length: ${rawOpenRouterKey.length})` : "MISSING",
+    GroqKey: groqPresent ? `PRESENT (Length: ${rawGroqKey.length})` : "MISSING",
+  });
 
   // Attempt 1: Gemini 2.5 Flash
   try {
+    if (!geminiPresent) {
+      throw new Error("Gemini API key (GEMINI_API_KEY) is not configured or empty.");
+    }
+
     const client = getGeminiClient();
     if (!client) {
-      throw new Error("Gemini API key is not configured.");
+      throw new Error("Failed to initialize GoogleGenAI client (no valid key).");
     }
 
     console.log("[AI-ROUTER-GEMINI] Routing primary request to Gemini...");
-    
+    console.log("[AI-ROUTER-GEMINI] Request URL: (SDK Call to gemini-2.5-flash via @google/genai SDK)");
+    console.log(`[AI-ROUTER-GEMINI] Authorized Key (Masked): "${rawGeminiKey.slice(0, 6)}...${rawGeminiKey.slice(-4)}"`);
+
     const config: any = {
       responseMimeType: "application/json",
     };
     if (systemInstruction) {
       config.systemInstruction = systemInstruction;
-      console.log(`[AI-ROUTER-GEMINI] With systeminstruction: "${systemInstruction.slice(0, 80)}..."`);
+      console.log(`[AI-ROUTER-GEMINI] Appending systemInstruction payload: "${systemInstruction.slice(0, 100)}..."`);
     }
     if (geminiSchema) {
       config.responseSchema = geminiSchema;
     }
 
-    // Call Gemini with 15-second timeout safeguard
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
       console.warn("[AI-ROUTER-GEMINI-TIMEOUT] Gemini did not respond within 15s. Aborting...");
@@ -137,7 +168,7 @@ async function callAIWithFallback<T>(
     }, 15000);
 
     try {
-      console.log("[AI-ROUTER-GEMINI] Requesting generateContent from Gemini client...");
+      console.log("[AI-ROUTER-GEMINI] Dispatching generateContent...");
       const response = await client.models.generateContent({
         model: "gemini-2.5-flash",
         contents: prompt,
@@ -146,29 +177,31 @@ async function callAIWithFallback<T>(
       clearTimeout(timeoutId);
 
       const text = response.text || "";
-      console.log(`[AI-ROUTER-GEMINI-SUCCESS] Received response. Text length: ${text.length}. Parsing JSON...`);
+      console.log(`[AI-ROUTER-GEMINI-SUCCESS] Answer length: ${text.length}. Parsing JSON...`);
       const cleaned = cleanJsonOutput(text);
       const parsed = JSON.parse(cleaned);
-      console.log("[AI-ROUTER-GEMINI-SUCCESS] Successfully parsed Gemini JSON payload!");
+      console.log("[AI-ROUTER-GEMINI-SUCCESS] Successfully parsed Gemini JSON database record!");
       return { data: parsed as T, provider: "Gemini 2.5 Flash" };
     } catch (err: any) {
       clearTimeout(timeoutId);
-      console.error("[AI-ROUTER-GEMINI-ERROR] Exception in Gemini API pipeline:", err);
+      console.error("[AI-ROUTER-GEMINI-ERROR] Exception in Gemini API execution block:", err);
       throw err;
     }
   } catch (err: any) {
-    console.error(`[AI-ROUTER] Gemini 2.5 Flash failed (Error: ${err.message || String(err)}). Cascading automatically to Mixtral...`);
+    console.error(`[AI-ROUTER] Gemini 2.5 Flash failed (Error: ${err.message || String(err)}). Cascading automatically to Mixtral falls...`);
     errors.push(err);
   }
 
-  // Attempt 2: OpenRouter Mixtral 8x7B
+  // Attempt 2: OpenRouter Mixtral 8x7B (Mistral AI)
   try {
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) {
-      throw new Error("OpenRouter API key is not configured.");
+    if (!openRouterPresent) {
+      throw new Error("OpenRouter API key (OPENROUTER_API_KEY) is not configured or empty.");
     }
 
     console.log("[AI-ROUTER-OPENROUTER] Routing secondary request to OpenRouter Mixtral...");
+    console.log("[AI-ROUTER-OPENROUTER] Type of provider selection: This model is mistralai/mixtral-8x7b-instruct provided through OpenRouter.");
+    console.log("[AI-ROUTER-OPENROUTER] Request URL: https://openrouter.ai/api/v1/chat/completions");
+    console.log(`[AI-ROUTER-OPENROUTER] Authorization Header sent: "Bearer ${rawOpenRouterKey.slice(0, 7)}...${rawOpenRouterKey.slice(-5)}"`);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
@@ -177,12 +210,12 @@ async function callAIWithFallback<T>(
     }, 20000);
 
     try {
-      console.log("[AI-ROUTER-OPENROUTER] Dispatching HTTP fetch to openrouter.ai...");
+      console.log("[AI-ROUTER-OPENROUTER] Dispatching fetch call to openrouter.ai...");
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
+          "Authorization": `Bearer ${rawOpenRouterKey}`,
           "HTTP-Referer": "https://ai.studio/build",
           "X-Title": "ResumeAI",
         },
@@ -202,7 +235,7 @@ async function callAIWithFallback<T>(
 
       if (!response.ok) {
         const errText = await response.text();
-        console.error(`[AI-ROUTER-OPENROUTER-HTTP-ERROR] Stats: ${response.status}. Details:`, errText);
+        console.error(`[AI-ROUTER-OPENROUTER-HTTP-ERROR] HTTP status code: ${response.status}. Details:`, errText);
         throw new Error(`OpenRouter API responded with status ${response.status}: ${errText}`);
       }
 
@@ -214,7 +247,7 @@ async function callAIWithFallback<T>(
       return { data: parsed as T, provider: "OpenRouter Mixtral 8x7B" };
     } catch (err: any) {
       clearTimeout(timeoutId);
-      console.error("[AI-ROUTER-OPENROUTER-ERROR] Exception in OpenRouter pipeline:", err);
+      console.error("[AI-ROUTER-OPENROUTER-ERROR] Exception in OpenRouter execution block:", err);
       throw err;
     }
   } catch (err: any) {
@@ -224,12 +257,14 @@ async function callAIWithFallback<T>(
 
   // Attempt 3: Groq Llama 3.3 70B
   try {
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) {
-      throw new Error("Groq API key is not configured.");
+    if (!groqPresent) {
+      throw new Error("Groq API key (GROQ_API_KEY) is not configured or empty.");
     }
 
     console.log("[AI-ROUTER-GROQ] Routing tertiary request to Groq Llama 3.3 70B...");
+    console.log("[AI-ROUTER-GROQ] Provider selection details: Llama 3.3 model from Groq Cloud infrastructure.");
+    console.log("[AI-ROUTER-GROQ] Request URL: https://api.groq.com/openai/v1/chat/completions");
+    console.log(`[AI-ROUTER-GROQ] Authorization Header sent: "Bearer ${rawGroqKey.slice(0, 6)}...${rawGroqKey.slice(-4)}"`);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
@@ -243,7 +278,7 @@ async function callAIWithFallback<T>(
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
+          "Authorization": `Bearer ${rawGroqKey}`,
         },
         body: JSON.stringify({
           model: "llama-3.3-70b-versatile",
@@ -261,7 +296,7 @@ async function callAIWithFallback<T>(
 
       if (!response.ok) {
         const errText = await response.text();
-        console.error(`[AI-ROUTER-GROQ-HTTP-ERROR] Stats: ${response.status}. Details:`, errText);
+        console.error(`[AI-ROUTER-GROQ-HTTP-ERROR] HTTP status code: ${response.status}. Details:`, errText);
         throw new Error(`Groq API responded with status ${response.status}: ${errText}`);
       }
 
@@ -273,7 +308,7 @@ async function callAIWithFallback<T>(
       return { data: parsed as T, provider: "Groq Llama 3.3" };
     } catch (err: any) {
       clearTimeout(timeoutId);
-      console.error("[AI-ROUTER-GROQ-ERROR] Exception in Groq API pipe:", err);
+      console.error("[AI-ROUTER-GROQ-ERROR] Exception in Groq API pipeline:", err);
       throw err;
     }
   } catch (err: any) {
@@ -286,7 +321,7 @@ async function callAIWithFallback<T>(
     "All available AI providers (Gemini, OpenRouter, and Groq) failed to complete this operation. " +
     "This can be due to temporary network issues, regional availability constraints, or invalid authentication on secrets. " +
     "Diagnostics:\n" +
-    errors.map((e, idx) => `  Provider #${idx + 1}: ${e.message}`).join("\n")
+    errors.map((e, idx) => `  Provider #${idx + 1}: ${e.message || String(e)}`).join("\n")
   );
 }
 
@@ -297,12 +332,16 @@ export async function analyzeResume(
   resumeText: string,
   jobDescription?: string
 ): Promise<{ data: AnalysisData; provider: string }> {
+  // Safe truncation to avoid hitting token count thresholds on smaller models
+  const safeResume = truncateInputs(resumeText || "", 15000);
+  const safeJob = jobDescription ? truncateInputs(jobDescription, 8000) : "";
+
   const prompt = `You are an elite automated recruiter. Analyze this candidate resume text and extract critical metrics. 
 If a job description is supplied below, evaluate keyword optimizations, grammatical constructs, streaks, strengths, weaknesses, and ATS alignments.
 
-${jobDescription ? `Target Job Description:\n${jobDescription}\n\n` : ""}
+${safeJob ? `Target Job Description:\n${safeJob}\n\n` : ""}
 Candidate Resume Content:
-${resumeText}
+${safeResume}
 
 You MUST return a valid JSON object matching this schema exactly:
 {
@@ -389,13 +428,17 @@ export async function matchJobDescription(
   resumeText: string,
   jobDescription: string
 ): Promise<{ data: JobMatchData; provider: string }> {
+  // Safe truncation of inputs to preserve token limits
+  const safeResume = truncateInputs(resumeText || "", 15000);
+  const safeJob = truncateInputs(jobDescription || "", 8000);
+
   const prompt = `Compare this candidate resume against the target Job Description. Highlight percentage similarity coefficient, missing skills, improvements, and personalized recruiter feedback.
 
 Candidate Resume:
-${resumeText}
+${safeResume}
 
 Target Job Description:
-${jobDescription}
+${safeJob}
 
 You MUST return a valid JSON object matching this schema exactly:
 {
@@ -437,10 +480,14 @@ export async function generateCareerRoadmap(
   skills: string,
   role: string
 ): Promise<{ data: CareerRoadmapData; provider: string }> {
+  // Safe truncation of input fields
+  const safeSkills = truncateInputs(skills || "", 5000);
+  const safeRole = truncateInputs(role || "", 3000);
+
   const prompt = `Generate a rigorous, actionable career growth roadmap to assist a professional in transitioning into their target role.
 
-Current Skills: ${skills || "None specified"}
-Target Role: ${role || "None specified"}
+Current Skills: ${safeSkills || "None specified"}
+Target Role: ${safeRole || "None specified"}
 
 You MUST return a valid JSON object matching this schema exactly:
 {
@@ -518,13 +565,17 @@ export async function generateCoverLetter(
   resumeText: string,
   jobDescription: string
 ): Promise<{ data: CoverLetterData; provider: string }> {
+  // Safe truncation of input fields
+  const safeResume = truncateInputs(resumeText || "", 15000);
+  const safeJob = truncateInputs(jobDescription || "", 8000);
+
   const prompt = `Write a bespoke, highly persuasive cover letter leveraging the candidate's achievements to align directly with a target job description.
 
 Candidate Resume details:
-${resumeText}
+${safeResume}
 
 Target Job Details:
-${jobDescription}
+${safeJob}
 
 You MUST return a valid JSON object matching this schema exactly:
 {
